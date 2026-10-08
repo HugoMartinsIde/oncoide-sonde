@@ -1,0 +1,84 @@
+# ════════════════════════════════════════════════════════════════════
+#  Sonde externe d'OncoIDE — hébergée chez GitHub, hors de Vercel et
+#  de Supabase
+#
+#  La surveillance principale d'OncoIDE tourne chez Vercel (sonde toutes
+#  les cinq minutes) et chez Supabase (veille de la base). Si les DEUX
+#  tombent ensemble, aucune des deux ne peut prévenir. Cette sonde
+#  tourne ailleurs : sur l'infrastructure de GitHub. Quand une
+#  vérification échoue deux fois de suite, la tâche échoue, et GitHub
+#  envoie un courriel au propriétaire du dépôt.
+#
+#  Elle ne lit que des adresses publiques. Aucun secret : la clé
+#  Supabase ci-dessous est la clé PUBLIABLE, servie à chaque navigateur
+#  par la page d'accueil du site.
+# ════════════════════════════════════════════════════════════════════
+name: sonde
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sonde
+  cancel-in-progress: false
+
+jobs:
+  verifier:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Vérifier l'application, le site, l'API et l'authentification
+        shell: bash
+        run: |
+          set -u
+          echecs=0
+          verifier () {
+            local nom="$1" url="$2" attendu="$3" entete="${4:-}"
+            for essai in 1 2; do
+              if [ -n "$entete" ]; then corps=$(curl -fsS -m 15 -H "$entete" "$url" 2>&1); else corps=$(curl -fsS -m 15 "$url" 2>&1); fi
+              code=$?
+              if [ $code -eq 0 ] && grep -q -- "$attendu" <<<"$corps"; then
+                echo "OK     $nom"
+                return 0
+              fi
+              [ $essai -eq 1 ] && sleep 20
+            done
+            echo "::error title=$nom::$nom ne répond pas comme attendu ($url)"
+            echecs=$((echecs + 1))
+          }
+          verifier "Application"      "https://app.oncoide.fr/"                        'id="root"'
+          verifier "API"              "https://app.oncoide.fr/api/health?leger=1"      '"status":"ok"'
+          verifier "Site public"      "https://www.oncoide.fr/"                        "OncoIDE"
+          verifier "Authentification" "https://urirsoxmuhadrpjyhjlq.supabase.co/auth/v1/health" "GoTrue" "apikey: sb_publishable_tiFTVWoQkVmcNoR2gRPeTg_HpdHWOrs"
+          if [ $echecs -gt 0 ]; then
+            echo "$echecs vérification(s) en échec : voir https://www.oncoide.fr/statut"
+            exit 1
+          fi
+
+  # GitHub désactive les tâches planifiées d'un dépôt public sans activité
+  # depuis soixante jours. Une fois par mois, la sonde écrit la date de
+  # son dernier passage : le dépôt reste actif, la sonde aussi.
+  entretien:
+    if: github.event_name == 'schedule' && github.event.schedule == '*/10 * * * *'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Garder le dépôt actif (une fois par mois)
+        shell: bash
+        run: |
+          mois=$(date -u +%Y-%m)
+          if [ "$(cat dernier-passage.txt 2>/dev/null | cut -c1-7)" != "$mois" ]; then
+            date -u +%Y-%m-%dT%H:%MZ > dernier-passage.txt
+            git config user.name "sonde-oncoide"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add dernier-passage.txt
+            git commit -m "Sonde : passage du mois $mois"
+            git push
+          fi
